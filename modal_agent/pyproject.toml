@@ -1,0 +1,19 @@
+[project]
+name = "personal-assistant"
+version = "0.1.0"
+description = "Autonomous Multi-Agent Assistant"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=0.2.0",
+    "langchain>=0.2.0",
+    "langchain-openai>=0.1.7",
+    "yt-dlp>=2024.4.9",
+    "openai-whisper>=20231117",
+    "streamlit>=1.44.0",
+    "pydantic>=2.7.0",
+    "requests>=2.32.0",
+    "fastapi>=0.111.0",
+    "lancedb>=0.30.0",
+    "fastembed>=0.4.0",
+    "langchain-text-splitters>=0.3.0"
+]

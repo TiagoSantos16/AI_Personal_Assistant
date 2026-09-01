@@ -1,0 +1,10 @@
+__pycache__/
+.ipynb_checkpoints/
+playground_output/
+.bin/
+.env
+.modal/
+.venv/
+venv/
+.pytest_cache/
+.DS_Store
