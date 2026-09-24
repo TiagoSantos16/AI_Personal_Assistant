@@ -1,25 +1,31 @@
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
+# Ultra-cheap paid fallbacks (< $0.01 per request) to guarantee 100% uptime
+CHEAP_PAID_TEXT_FALLBACK = "deepseek/deepseek-chat"
+CHEAP_PAID_VISION_FALLBACK = "google/gemini-2.5-flash"
+
+# Basic JSON routing and simple extraction
 BASIC_MODELS = [
-    "poolside/laguna-xs-2.1:free",
-    "google/gemma-4-31b-it:free",
-    "inclusionai/ling-3.0-flash:free",
-    "nvidia/nemotron-3-nano-30b-a3b:free",
-]
-
-EDITOR_MODELS = [
-    "google/gemma-4-31b-it:free",
-    "minimax/minimax-m2.7:free",
+    "poolside/laguna-s-2.1:free",
+    "nex-agi/nex-n2.5-mini:free",
     "thinkingmachines/inkling:free",
-    "nvidia/nemotron-3.5-lightning:free",
-    "openai/gpt-oss-20b:free",
+    CHEAP_PAID_TEXT_FALLBACK
 ]
 
+# Editor / Critic nodes (Requires strong reasoning to verify facts and format)
+EDITOR_MODELS = [
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "poolside/laguna-s-2.1:free",
+    "dots-studio/dots-3-note-preview:free",
+    CHEAP_PAID_TEXT_FALLBACK
+]
+
+# Content formatting (Writing prose, creativity, summarization)
 CONTENT_MODELS = [
     "nvidia/nemotron-3-super-120b-a12b:free",
-    "minimax/minimax-m3:free",
+    "dots-studio/dots-3-note-preview:free",
     "z-ai/glm-5.2:free",
-    "nvidia/nemotron-3-ultra-550b-a55b:free",
+    CHEAP_PAID_TEXT_FALLBACK
 ]
 
 TITLE_MODELS = BASIC_MODELS
@@ -33,17 +39,17 @@ CULINARY_MODELS = CONTENT_MODELS
 ENTERTAINMENT_MODELS = CONTENT_MODELS
 TRAVEL_MODELS = CONTENT_MODELS
 
+# Vision models for analyzing frames
 VISION_CONTENT_MODELS = [
-    "minimax/minimax-m3:free",
-    "google/gemma-4-31b-it:free",
     "thinkingmachines/inkling:free",
-    "google/gemma-4-26b-a4b-it:free",
-    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
-    "nvidia/nemotron-nano-12b-v2-vl:free",
+    "google/gemma-4-31b-it:free",
+    CHEAP_PAID_VISION_FALLBACK 
 ]
 
+# RAG models for semantic synthesis and LanceDB search
 RAG_MODELS = [
     "nvidia/nemotron-3-ultra-550b-a55b:free",
-    "google/gemma-4-31b-it:free",
+    "dots-studio/dots-3-note-preview:free",
     "z-ai/glm-5.2:free",
+    CHEAP_PAID_TEXT_FALLBACK
 ]

@@ -6,10 +6,13 @@ import modal
 from core.processor import (
     _error_message,
     find_notes,
+    media_kind,
+    process_post,
     process_reel,
     read_notes,
     redo_note,
     send_telegram_message,
+    process_url,
 )
 
 URL_RE = re.compile(r"https?://\S+")
@@ -55,8 +58,18 @@ def process_background(url: str, chat_id: int | None):
     process_reel(url, chat_id, vol)
 
 
+@app.function(image=image, volumes={"/data": vol}, secrets=secrets, timeout=420)
+def process_post_background(url: str, chat_id: int | None):
+    process_post(url, chat_id, vol)
+
+
 @app.function(image=image, volumes={"/data": vol}, secrets=secrets, gpu="T4", timeout=600)
 def redo_background(note_name: str):
+    redo_note(note_name, None, vol)
+
+
+@app.function(image=image, volumes={"/data": vol}, secrets=secrets, timeout=420)
+def redo_post_background(note_name: str):
     redo_note(note_name, None, vol)
 
 
@@ -70,7 +83,7 @@ def ask_background(question: str, chat_id: int | None):
         if result["sources"]:
             reply += "\n\nSources:\n" + "\n".join(f"- {s}" for s in result["sources"])
     except Exception as exc:
-        reply = _error_message(exc)
+        reply = _error_message(exc, "question")
     send_telegram_message(chat_id, reply)
 
 
@@ -113,13 +126,18 @@ def telegram_webhook(request: dict):
             ask_background.spawn(parts[1], chat_id)
 
     elif match := URL_RE.search(text):
-        send_telegram_message(chat_id, "Processing reel in background...")
-        process_background.spawn(match.group(0), chat_id)
+        url = match.group(0)
+        if media_kind(url) == "post":
+            send_telegram_message(chat_id, "Processing post in background...")
+            process_post_background.spawn(url, chat_id)
+        else:
+            send_telegram_message(chat_id, "Processing reel in background...")
+            process_background.spawn(url, chat_id)
 
     else:
         send_telegram_message(
             chat_id,
-            "Send me an Instagram Reel URL, or try /notes, /find <keyword> and /ask <question>.",
+            "Send me an Instagram Reel or post URL, or try /notes, /find <keyword> and /ask <question>.",
         )
 
     return {"status": "ok"}

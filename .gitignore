@@ -1,6 +1,7 @@
 __pycache__/
 .ipynb_checkpoints/
 playground_output/
+playground_output_posts/
 .bin/
 .env
 .modal/

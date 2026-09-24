@@ -298,7 +298,14 @@ with st.sidebar:
             try:
                 ask_result = ask_notes(question)
             except Exception as exc:
-                ask_error = _error_message(exc)
+                ask_error = _error_message(exc, "question")
+    if st.button("Reindex notes"):
+        import modal
+        from core.rag import reindex_all_notes
+
+        with st.spinner("Reindexing notes..."):
+            reindex_all_notes(modal.Volume.from_name("personal-assistant-data-v2"))
+        st.success("Notes reindexed.")
     st.divider()
     if view == "notes":
         if st.button(f"Failed Summaries ({len(failed_notes)})", use_container_width=True):
@@ -426,7 +433,9 @@ else:
             import modal
 
             try:
-                modal.Function.from_name("personal-assistant", "redo_background").spawn(note["name"])
+                url_path = (note.get("url") or "").split("?")[0]
+                worker = "redo_post_background" if "/p/" in url_path else "redo_background"
+                modal.Function.from_name("personal-assistant", worker).spawn(note["name"])
                 st.success("Reprocessing started. Refresh in a minute.")
             except Exception as exc:
                 st.error(f"Could not start reprocessing: {exc}")
@@ -438,7 +447,7 @@ else:
 
     col_reel, col_creator, _ = st.columns([1.5, 3, 4])
     if note.get("url"):
-        col_reel.link_button("🎬 View Reel", note["url"])
+        col_reel.link_button("🎬 View post", note["url"])
     if note.get("creator_url"):
         col_creator.markdown(f"[@{_creator_username(note)}]({note['creator_url']})")
     elif note.get("uploader"):

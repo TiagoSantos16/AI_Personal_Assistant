@@ -35,6 +35,15 @@ WRITER_STYLE = (
     "closing lines, or 'feel free to...' filler."
 )
 
+WRITER_STYLE_POST = (
+    WRITER_STYLE.replace("this reel", "this post")
+    .replace("watching the video again", "opening the post again")
+)
+
+
+def _style(state: AgentState) -> str:
+    return WRITER_STYLE if state.get("video_path") else WRITER_STYLE_POST
+
 
 def _run(
     llms,
@@ -75,8 +84,14 @@ def title_node(state: AgentState) -> AgentState:
         "Name the topic or contents, like someone naming a note in their notes app. "
         "Never name the reel itself: no hooks, no questions, no what-the-presenter-said titles. "
         "Return ONLY the title, without quotes."
-        f"\n\nTranscript:\n{state['transcript'][:6000]}"
     )
+    transcript = state["transcript"][:6000]
+    if transcript.strip():
+        prompt += f"\n\nTranscript:\n{transcript}"
+    else:
+        description = (state.get("description") or "").strip()
+        if description:
+            prompt += f"\n\nPost description:\n{description[:6000]}"
     state["title"] = _run(get_llm(TITLE_MODELS), TITLE_MODELS, prompt, state, agent="title").strip(" \"'#")
     return state
 
@@ -101,12 +116,14 @@ def router_node(state: AgentState) -> AgentState:
 
 
 def _worker_prompt(state: AgentState, role: str, task: str) -> str:
+    has_video = bool(state.get("video_path"))
+    media_word = "reel" if has_video else "post"
     if state["critique"] and state["critique"] != "approved":
         return (
             f"You are the {role} Writer. The Critic asked for changes to your note.\n\n"
             f"Critique:\n{state['critique']}\n\n"
             f"Previous note:\n{state['notes'][-1]}\n\n"
-            f"{WRITER_STYLE}\nReturn ONLY the revised note."
+            f"{_style(state)}\nReturn ONLY the revised note."
         )
     prompt = (
         f"You are the {role} Writer. {task}\n\n"
@@ -117,14 +134,14 @@ def _worker_prompt(state: AgentState, role: str, task: str) -> str:
         prompt += f"\n\nPost description:\n{description[:1500]}\n"
     if state.get("images"):
         prompt += (
-            "\n\nFrames from the video are attached as additional context. "
+            f"\n\n{'Frames from the video' if has_video else 'Images from the post'} are attached as additional context. "
             "Use them to recover information the audio misses: menus, on-screen text, "
             "listings, products, tools, UI, ingredients, captions, or anything visible "
             "that belongs in the note. Write it as information about the subject, not as "
-            "a description of the video."
+            "a description of the content."
         )
     prompt += (
-        "\n\nThe transcript, the frames, and the post description are separate sources of "
+        "\n\nThe transcript, the frames/images, and the post description are separate sources of "
         "the same underlying content. They should complement each other: use every piece "
         "of subject information they offer. Audio can be silent, music-only, noisy, or "
         "unreliable, and a frame may just be a person talking or a transition that adds "
@@ -132,7 +149,7 @@ def _worker_prompt(state: AgentState, role: str, task: str) -> str:
         "information, simply ignore it. At least one of the sources is usually useful; "
         "sometimes all are, sometimes only one or two."
     )
-    return prompt + f"\n\n{WRITER_STYLE}"
+    return prompt + f"\n\n{_style(state)}"
 
 
 def culinary_node(state: AgentState) -> AgentState:
@@ -249,10 +266,13 @@ def travel_node(state: AgentState) -> AgentState:
 
 
 def critic_node(state: AgentState) -> AgentState:
+    has_video = bool(state.get("video_path"))
+    media_word = "reel" if has_video else "post"
+    revisit_phrase = "watching the video" if has_video else "opening the post"
     prompt = (
-        "You are a meticulous editor. The note below describes the subject of a reel: a "
+        f"You are a meticulous editor. The note below describes the subject of a {media_word}: a "
         "thing, a tool, a place, steps, or information the viewer can rely on later without "
-        "rewatching the video. It must read as a standalone factual note about the subject, "
+        f"{revisit_phrase} again. It must read as a standalone factual note about the subject, "
         "not as a summary of the video or an account of what the presenter did, said, or "
         "showed on screen.\n"
         "Check that the note reports subject facts and does not narrate the video or the "

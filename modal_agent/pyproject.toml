@@ -15,5 +15,6 @@ dependencies = [
     "fastapi>=0.111.0",
     "lancedb>=0.30.0",
     "fastembed>=0.4.0",
-    "langchain-text-splitters>=0.3.0"
+    "langchain-text-splitters>=0.3.0",
+    "Pillow>=10.0.0"
 ]
