@@ -1,22 +1,23 @@
-from typing import List, Optional
-from typing_extensions import TypedDict
+from typing import TypedDict
 
 
-class AgentState(TypedDict):
+class AgentState(TypedDict, total=False):
     url: str
     video_path: str
     transcript: str
-    segments: List[dict]
     description: str
-    images: List[str]
+    images: list[str]
     title: str
     category: str
-    notes: List[str]
-    writer_history: List[str]
+    writer_history: list[str]
     critique: str
-    critique_history: List[str]
-    model_log: List[dict]
-    retries: int
-    final_note: Optional[str]
-    error: Optional[str]
-    models_used: List[str]
+    critique_history: list[str]
+    model_log: list[dict]
+    final_note: str
+    visual_extraction: str
+    coverage: list[str]
+    drafts: int
+    review_status: str
+    raw_media_ids: list[int]
+    routing_degraded: bool
+    writer_failed: bool

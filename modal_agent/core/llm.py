@@ -3,6 +3,9 @@ import logging
 import os
 import re
 import time
+import random
+from functools import lru_cache
+from contextvars import ContextVar
 
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
@@ -13,8 +16,7 @@ from core.config import OPENROUTER_BASE_URL
 
 logger = logging.getLogger(__name__)
 
-RETRY_ATTEMPTS = 3
-RETRY_BASE_DELAY = 2.0
+RETRY_ATTEMPTS = 2
 RETRYABLE_STATUS = {408, 500, 502, 503, 504}
 NETWORK_ERROR_TYPES = (ConnectionError, TimeoutError)
 NETWORK_ERROR_NAMES = {"APIConnectionError", "APITimeoutError", "RemoteProtocolError"}
@@ -141,8 +143,10 @@ def is_retryable(exc: Exception) -> bool:
     if status == 429:
         # Shared-pool congestion clears in seconds; a daily cap has a reset
         # timestamp hours away and is pointless to retry within this call.
+        if any(word in str(exc).lower() for word in ("daily", "quota", "credits", "per day")):
+            return False
         reset = _extract_reset_seconds(exc)
-        return reset is None or reset <= 30
+        return reset is not None and reset <= 10
     if status is not None:
         return status in RETRYABLE_STATUS
     if isinstance(exc, NETWORK_ERROR_TYPES) or exc.__class__.__name__ in NETWORK_ERROR_NAMES:
@@ -151,54 +155,94 @@ def is_retryable(exc: Exception) -> bool:
     return any(hint in lowered for hint in NETWORK_HINTS)
 
 
-def _retry_delay(failures: list[tuple[str, Exception]], attempt: int) -> float:
-    hints = [
-        s
-        for _, exc in failures
-        if _status_of(exc) == 429
-        for s in [_extract_reset_seconds(exc)]
-        if s is not None and s <= 30
-    ]
-    if hints:
-        return max(1.0, min(hints) + 1)
-    return RETRY_BASE_DELAY * (2 ** (attempt - 1))
+CALL_CONTEXT = ContextVar("call_context", default=None)
 
 
-def invoke_with_retry(llms: list[ChatOpenAI], content):
+def response_text(response):
+    value = response.content
+    if isinstance(value, list):
+        value = "\n".join(block.get("text", "") for block in value if isinstance(block, dict))
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Empty model response")
+    if response.response_metadata.get("finish_reason") in {"length", "max_tokens"}:
+        raise ValueError("Truncated model response")
+    return value.strip()
+
+
+def invoke_with_retry(llms: list[ChatOpenAI], content, *, step="generation", output=1200, deadline=None, structured=False):
+    from core.accounting import record
+    context = CALL_CONTEXT.get() or {}
+    deadline = deadline or context.get("deadline") or time.monotonic() + 180
     failures: list[tuple[str, Exception]] = []
-    for attempt in range(1, RETRY_ATTEMPTS + 1):
-        failures = []
-        for llm in llms:
+    for llm in llms:
+        for attempt in range(RETRY_ATTEMPTS):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Generation deadline exhausted")
+            started = time.monotonic()
+            payload = {"model": llm.model_name}
             try:
-                return llm.invoke(content)
+                # SDK request kwargs override the cached client's defaults too.
+                options = {"timeout": min(float(os.environ.get("GENERATIVE_TIMEOUT_SECONDS", "45")), remaining), "max_tokens": output}
+                if structured:
+                    options["response_format"] = {"type": "json_object"}
+                response = llm.invoke(content, **options)
+                payload.update(response.response_metadata.get("accounting", {}))
+                response_text(response)
+                if context.get("record"):
+                    context["record"](record(payload, step, time.monotonic() - started))
+                return response
             except Exception as exc:
+                body = getattr(exc, "body", None)
+                if isinstance(body, dict):
+                    payload.update({key: body[key] for key in ("id", "model", "provider", "usage") if key in body})
+                if context.get("record"):
+                    context["record"](record(payload, step, time.monotonic() - started, False))
                 failures.append((llm.model_name, exc))
-        if not any(is_retryable(exc) for _, exc in failures) or attempt == RETRY_ATTEMPTS:
-            break
-        delay = _retry_delay(failures, attempt)
-        logger.warning(
-            f"All {len(llms)} models failed; retrying in {delay:.0f}s (attempt {attempt}/{RETRY_ATTEMPTS})"
-        )
-        time.sleep(delay)
+                if not is_retryable(exc) or attempt + 1 == RETRY_ATTEMPTS:
+                    break
+                delay = min(10, _extract_reset_seconds(exc) or 1) + random.uniform(0, .3)
+                if delay + .1 >= deadline - time.monotonic():
+                    break
+                time.sleep(delay)
     raise ProviderChainError(failures)
 
 
 def build_vision_messages(prompt: str, image_paths: list[str]) -> list[dict]:
     content: list[dict] = [{"type": "text", "text": prompt}]
     for path in image_paths:
-        with open(path, "rb") as f:
-            encoded = base64.b64encode(f.read()).decode()
+        encoded = _encoded(path, os.path.getmtime(path))
         content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}})
     return [{"role": "user", "content": content}]
 
 
+@lru_cache(maxsize=64)
+def _encoded(path, modified):
+    with open(path, "rb") as handle:
+        return base64.b64encode(handle.read()).decode()
+
+
+class AccountingChatOpenAI(ChatOpenAI):
+    """Keep OpenRouter charge metadata otherwise dropped by LangChain."""
+    def _create_chat_result(self, response, generation_info=None):
+        payload = response if isinstance(response, dict) else response.model_dump()
+        result = super()._create_chat_result(response, generation_info)
+        compact = {key: payload.get(key) for key in ("id", "model", "provider", "usage")}
+        for generation in result.generations:
+            generation.message.response_metadata["accounting"] = compact
+        return result
+
+
+@lru_cache(maxsize=16)
 def _chat_model(model: str) -> ChatOpenAI:
-    return ChatOpenAI(
+    return AccountingChatOpenAI(
         base_url=OPENROUTER_BASE_URL,
         api_key=os.environ["OPENROUTER_API_KEY"],
         model=model,
         temperature=0.3,
-        timeout=60,
+        timeout=45,
+        max_retries=0,
+        max_tokens=1200,
     )
 
 
