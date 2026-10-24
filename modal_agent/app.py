@@ -3,7 +3,7 @@ import logging
 import os
 import modal
 from fastapi import Request, HTTPException
-from core.requests import authorised, command, urls, canonical_source
+from core.requests import authorised, command, urls, canonical_source, link_instructions
 from core.telegram import send, react
 from core.errors import redact
 
@@ -87,14 +87,100 @@ def redo_background(note_name: str, section: str = "notes"):
 def ask_background(question: str, chat_id: int = None):
     from core.rag import answer, still_visible
     try:
-        result = answer(question, storage.remote("retrieve", {"question": question}))
-        result = still_visible(result, storage.remote("list")["records"])
+        memories = storage.remote("memory_list", {"query": question})
+        result = answer(question, storage.remote("retrieve", {"question": question}), memories=memories)
+        result = still_visible(result, storage.remote("list")["records"], storage.remote("memory_list"))
         reply = result["answer"]
         if result["sources"]:
             reply += "\n\nSources:\n" + "\n".join(result.get("source_titles", {}).get(name, name) for name in result.get("source_labels", {}).values())
     except Exception:
         reply = "I couldn't search your notes right now. Please try again later."
     send(chat_id, reply)
+
+
+def revise_source(text, context, chat_id, message_id):
+    if context.get("status") != "found":
+        send(chat_id, "Reply to the original link message so I know which note to revise.")
+        return
+    try:
+        result = storage.remote("accept", {"url": context["url"], "context_job": context["context_job"],
+            "instructions": text, "chat_id": chat_id, "message_id": message_id})
+    except ValueError as exc:
+        send(chat_id, str(exc))
+        return
+    if result["status"] == "accepted":
+        react(chat_id, message_id)
+        if enqueue(result):
+            send(chat_id, "Updating that note with your instructions. Cached source evidence will be reused when available.")
+        else:
+            send(chat_id, "I kept your instructions, but couldn't start the revision. Retry it from Error/Failed.")
+    elif result["status"] in {"running", "active", "failed"}:
+        send(chat_id, "Those instructions are already saved for this source; no new generation was started.")
+    else:
+        send(chat_id, "That source changed while I was reading your message. Please reply to its link again.")
+
+
+@app.function(image=image, secrets=secrets, timeout=60)
+def conversation_background(text: str, context: dict, chat_id: int, message_id: int, memory_revision: int):
+    from core.conversation import interpret
+    try:
+        intent = interpret(text, context.get("status") == "found")
+        if intent.action == "instruction":
+            revise_source(text, context, chat_id, message_id)
+        elif intent.action == "remember":
+            item = storage.remote("memory_change", {"action": "remember", "text": intent.text,
+                "key": intent.key, "scope": intent.scope, "kind": intent.kind, "chat_id": chat_id,
+                "message_id": message_id, "expected_revision": memory_revision})
+            send(chat_id, f"Remembered [{item['id']}]: {item['text']}\nUse /correct or /forget with this ID to change it.")
+        elif intent.action == "clarify":
+            send(chat_id, "Please send one explicit fact to remember, or reply to the link with instructions for that note.")
+        else:
+            send(chat_id, "Use /ask for questions, /remember for personal facts, or reply to a link to revise its note.")
+    except Exception:
+        send(chat_id, "I couldn't finish applying that message. Check /memory or the note status, then use /remember, /correct, or /revise explicitly.")
+
+
+def memory_command(name, argument, chat_id, message_id):
+    """Exact commands never need an AI call or choose entries by fuzzy title."""
+    try:
+        if name == "memory":
+            items = storage.remote("memory_list", {"query": argument} if argument else None)
+            lines = [f"[{i['id']}] ({i['scope']}, {i['kind']}) {i['text']}\nUpdated: {i['updated']} · source message: {i['source']['message_id']}" for i in items]
+            # Telegram text limit: send bounded chunks without dropping entries.
+            chunk = ""
+            for line in lines:
+                if len(chunk) + len(line) > 3500:
+                    send(chat_id, chunk)
+                    chunk = ""
+                chunk += line + "\n\n"
+            send(chat_id, chunk or "No matching personal memories.")
+            return
+        payload = {"action": name, "chat_id": chat_id, "message_id": message_id}
+        if name == "remember":
+            key, sep, text = argument.partition("=")
+            if not sep or not key.strip() or not text.strip():
+                raise ValueError("Usage: /remember key = fact or preference")
+            # Optional scope and kind make deterministic preference entry possible.
+            parts = key.strip().split(":", 2)
+            if len(parts) == 3 and parts[0] in {"fact", "preference"}:
+                payload.update(kind=parts[0], scope=parts[1], key=parts[2].strip())
+            else:
+                payload["key"] = key.strip()
+            payload["text"] = text.strip()
+        elif name == "correct":
+            entry_id, sep, text = argument.partition(" ")
+            if not sep or not text.strip():
+                raise ValueError("Usage: /correct <memory ID> <replacement text>")
+            payload.update(id=entry_id, text=text.strip())
+        else:
+            if not argument or " " in argument:
+                raise ValueError("Usage: /forget <memory ID>")
+            payload["id"] = argument
+        item = storage.remote("memory_change", payload)
+        send(chat_id, (f"Forgot [{item['id']}]." if name == "forget" else
+            f"Remembered [{item['id']}]: {item['text']}") if item else "Memory ID not found.")
+    except (ValueError, KeyError) as exc:
+        send(chat_id, str(exc) if isinstance(exc, ValueError) else "Memory ID not found. Use /memory to see IDs.")
 
 
 @app.function(image=image, secrets=secrets)
@@ -126,7 +212,16 @@ async def telegram_webhook(request: Request):
     if not storage.remote("update", {"update_id": update["update_id"]}):
         return {"status": "duplicate"}
     if name:
-        if name in {"notes", "find"}:
+        if name in {"memory", "remember", "correct", "forget"}:
+            memory_command(name, argument, chat_id, message.get("message_id"))
+        elif name == "revise":
+            context = storage.remote("source_context", {"chat_id": chat_id,
+                "reply_id": (message.get("reply_to_message") or {}).get("message_id")})
+            if not argument or len(argument) > 4000:
+                send(chat_id, "Usage: reply to a link with /revise <instructions, up to 4,000 characters>")
+            else:
+                revise_source(argument, context, chat_id, message.get("message_id"))
+        elif name in {"notes", "find"}:
             if name == "find" and not argument:
                 send(chat_id, "Usage: /find <keyword>")
                 return {"status": "ok"}
@@ -148,13 +243,30 @@ async def telegram_webhook(request: Request):
         send(chat_id, "Please send one Instagram link at a time.")
         return {"status": "ok"}
     if not links:
-        return {"status": "ignored"}
+        if not text:
+            return {"status": "ignored"}
+        if len(text) > 1000:
+            send(chat_id, "Please keep conversational messages under 1,000 characters, or use /revise for longer note instructions.")
+            return {"status": "ok"}
+        context = storage.remote("source_context", {"chat_id": chat_id,
+            "reply_id": (message.get("reply_to_message") or {}).get("message_id")})
+        conversation_background.spawn(text, context, chat_id, message.get("message_id"), storage.remote("memory_revision"))
+        return {"status": "ok"}
     try:
         source = canonical_source(links[0])
     except ValueError:
         send(chat_id, "Please send an Instagram reel or post link.")
         return {"status": "ok"}
-    result = storage.remote("accept", {**source, "chat_id": chat_id, "message_id": message.get("message_id"), "update_id": update["update_id"]})
+    instructions = link_instructions(message)
+    if len(instructions) > 4000:
+        send(chat_id, "Please keep note instructions under 4,000 characters.")
+        return {"status": "ok"}
+    try:
+        result = storage.remote("accept", {**source, "instructions": instructions,
+            "chat_id": chat_id, "message_id": message.get("message_id"), "update_id": update["update_id"]})
+    except ValueError as exc:
+        send(chat_id, str(exc))
+        return {"status": "ok"}
     if result["status"] == "accepted":
         react(chat_id, message.get("message_id"))
         if not enqueue(result):

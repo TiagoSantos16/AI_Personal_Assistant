@@ -21,3 +21,5 @@ class AgentState(TypedDict, total=False):
     raw_media_ids: list[int]
     routing_degraded: bool
     writer_failed: bool
+    instructions: list[dict]
+    memories: list[dict]

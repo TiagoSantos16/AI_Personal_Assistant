@@ -64,6 +64,9 @@ def dispatch(operation, payload=None, *, root="/data", volume=None):
     state = json.loads(registry.read_text(encoding="utf-8")) if registry.exists() else {
         "records": {}, "sources": {}, "jobs": {}, "updates": {}, "revision": 0}
     state.setdefault("retired", [])
+    state.setdefault("memories", {})
+    state.setdefault("memory_revision", 0)
+    state.setdefault("source_messages", {})
     if "section" in payload and payload["section"] not in {"notes", "failed"}:
         raise ValueError("Invalid record section")
     def commit():
@@ -73,6 +76,8 @@ def dispatch(operation, payload=None, *, root="/data", volume=None):
         state["revision"] += 1
         atomic(registry, state)
         commit()
+    def memory_changed(refs):
+        return any(state["memories"].get(ref["id"], {}).get("revision") != ref["revision"] for ref in refs)
     # Bootstrap only unknown legacy files. New files become visible only through
     # the registry switch, even if an earlier worker stopped mid-save.
     known = {(r["section"], r["name"]) for r in state["records"].values()}
@@ -89,6 +94,41 @@ def dispatch(operation, payload=None, *, root="/data", volume=None):
             changed = True
     if changed:
         persist()
+    if operation == "memory_revision":
+        return state["memory_revision"]
+    if operation == "memory_list":
+        from core.memory import select
+        entries = list(state["memories"].values())
+        if payload.get("query") is not None:
+            return select(entries, payload["query"], payload.get("purpose", "chat"))
+        return entries
+    if operation == "memory_change":
+        from core.memory import mutate
+        if payload.get("expected_revision", state["memory_revision"]) != state["memory_revision"]:
+            raise ValueError("Memory changed; please repeat your message")
+        result = mutate(state["memories"], payload)
+        state["memory_revision"] += 1
+        persist()
+        return result
+    if operation == "source_context":
+        chat = str(payload["chat_id"])
+        messages = state["source_messages"].get(chat, {})
+        if payload.get("reply_id") is not None:
+            entry = messages.get(str(payload["reply_id"]))
+            candidates = [entry] if entry else []
+        else:
+            candidates = [e for e in messages.values() if time.time() - e["created"] <= 600]
+        sources = {e["source_id"] for e in candidates}
+        if len(sources) != 1:
+            return {"status": "ambiguous" if sources else "missing"}
+        source_id = sources.pop()
+        lookup = state["sources"].get(source_id, {})
+        job = state["jobs"].get(lookup.get("job"))
+        if not job or job["status"] == "cancelled" or not (lookup.get("active") or lookup.get("failed") or
+                job["status"] in {"accepted", "running"}):
+            return {"status": "missing"}
+        return {"status": "found", "url": job["url"], "source_id": source_id,
+                "context_job": job["job_id"]}
     if operation == "list":
         lease = max(660, float(os.environ.get("JOB_LEASE_SECONDS", "900")))
         for job in state["jobs"].values():
@@ -136,11 +176,25 @@ def dispatch(operation, payload=None, *, root="/data", volume=None):
         lookup = state["sources"].setdefault(source["source_id"], {})
         previous = payload.get("previous")
         job = state["jobs"].get(lookup.get("job"))
+        instructions = payload.get("instructions", "").strip()
+        if len(instructions) > 4000:
+            raise ValueError("Use instructions up to 4,000 characters")
+        inherited = lookup.get("instructions", [])
+        revising = bool(instructions) and (not inherited or inherited[-1]["text"] != instructions)
+        if payload.get("context_job") and payload["context_job"] != lookup.get("job"):
+            return {"status": "context_changed"}
+        if payload.get("chat_id") is not None and payload.get("message_id") is not None:
+            messages = state["source_messages"].setdefault(str(payload["chat_id"]), {})
+            messages[str(payload["message_id"])] = {"source_id": source["source_id"], "created": time.time()}
+            # Bound reply lookup history; immediate context expires independently.
+            while len(messages) > 200:
+                del messages[next(iter(messages))]
+            persist()
         lease = max(660, float(os.environ.get("JOB_LEASE_SECONDS", "900")))
         if job and job["status"] in {"accepted", "running"}:
-            if not payload.get("explicit") or time.time() - job.get("claimed", job["created"]) < lease:
+            if not revising and (not payload.get("explicit") or time.time() - job.get("claimed", job["created"]) < lease):
                 return {"status": "running"}
-        if not payload.get("explicit"):
+        if not payload.get("explicit") and not revising:
             for field in ("active", "failed"):
                 if lookup.get(field) in state["records"]:
                     return {"status": field, "record": state["records"][lookup[field]]}
@@ -151,20 +205,47 @@ def dispatch(operation, payload=None, *, root="/data", volume=None):
             if previous_record["source_id"] != source["source_id"]:
                 raise ValueError("Retry source does not match the record")
             source["kind"] = previous_record["kind"]
+        if revising:
+            if sum(len(i["text"]) for i in inherited) + len(instructions) > 8000 or len(inherited) >= 20:
+                raise ValueError("This source has reached its instruction limit (20 messages / 8,000 characters)")
+            inherited = inherited + [{"text": instructions, "chat_id": payload.get("chat_id"),
+                "message_id": payload.get("message_id"), "created": time.time()}]
+        superseded_jobs, abandoned_costs = [], []
+        if revising and job and job["status"] in {"accepted", "running"}:
+            job["status"] = "superseded"
+            superseded_jobs = job.get("superseded_jobs", []) + [job["job_id"]]
+            abandoned_costs = job["accounting"]
+        lookup["instructions"] = inherited
         job_id, token = uuid.uuid4().hex, uuid.uuid4().hex
         job = {**source, "job_id": job_id, "attempt": token, "version_id": uuid.uuid4().hex,
                "created": time.time(), "status": "accepted", "previous": lookup.get("active"),
-               "chat_id": payload.get("chat_id"), "message_id": payload.get("message_id"), "accounting": []}
+               "chat_id": payload.get("chat_id"), "message_id": payload.get("message_id"),
+               "accounting": list(abandoned_costs), "superseded_jobs": superseded_jobs, "instructions": inherited}
         state["jobs"][job_id] = job
         lookup["job"] = job_id
         if "update_id" in payload:
             state["updates"][str(payload["update_id"])] = {"accepted": time.time(), "job_id": job_id}
         persist()
         return {"status": "accepted", "job": job}
-    if operation in {"claim", "save", "fail", "enqueue_failed", "notify", "ledger", "cache_put"}:
+    if operation in {"current", "claim", "save", "fail", "enqueue_failed", "notify", "ledger", "cache_put"}:
         job = state["jobs"][identifier(payload["job_id"])]
+        # An in-flight provider response can arrive after revision. Preserve its
+        # charge, but never let the superseded worker save content or evidence.
+        if operation == "ledger" and payload.get("attempt") == job["attempt"] and job["status"] == "superseded":
+            job["accounting"] = deduplicate(job["accounting"] + payload["records"])
+            lookup = state["sources"][job["source_id"]]
+            current = state["jobs"].get(lookup.get("job"), {})
+            if job["job_id"] in current.get("superseded_jobs", []):
+                current["accounting"] = deduplicate(current["accounting"] + payload["records"])
+                active = state["records"].get(lookup.get("active"), {})
+                if active.get("version_id") == current.get("version_id"):
+                    active["accounting"] = list(current["accounting"])
+            persist()
+            return True
         if payload.get("attempt") != job["attempt"] or state["sources"][job["source_id"]].get("job") != job["job_id"]:
             return {"status": "stale"}
+        if operation == "current":
+            return {"status": "current" if job["status"] == "running" and not memory_changed(payload.get("memory_refs", [])) else "stale"}
         if operation == "claim":
             if job["status"] != "accepted":
                 return {"status": "stale"}
@@ -200,6 +281,8 @@ def dispatch(operation, payload=None, *, root="/data", volume=None):
             job["status"] = "failed"
             persist()
             return item
+        if memory_changed(payload["metadata"].get("memory_refs", [])):
+            raise ValueError("Personal memory changed during generation; retry with current memory")
         name = "note--" + job["source_id"] + "--" + job["version_id"] + ".md"
         item = {**job, **payload["metadata"], "name": name, "section": "notes", "status": "saved",
                 "saved": time.time(), "index_pending": True, "accounting": deduplicate(job["accounting"])}

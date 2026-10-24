@@ -49,3 +49,17 @@ def urls(message):
     if not result:
         result = [u.rstrip(".,;!?)>]") for u in re.findall(r"https?://[^\s<>]+", text)]
     return list(dict.fromkeys(result))
+
+
+def link_instructions(message):
+    """Remove URL entities by UTF-16 offsets, including hidden-link labels."""
+    text = message.get("text") or message.get("caption") or ""
+    encoded = text.encode("utf-16-le")
+    entities = message.get("entities") or message.get("caption_entities") or []
+    for entity in sorted(entities, key=lambda e: e.get("offset", 0), reverse=True):
+        if entity.get("type") in {"url", "text_link"}:
+            start, length = entity.get("offset"), entity.get("length")
+            if isinstance(start, int) and isinstance(length, int) and start >= 0 and length > 0:
+                encoded = encoded[:start * 2] + encoded[(start + length) * 2:]
+    text = encoded.decode("utf-16-le")
+    return re.sub(r"https?://[^\s<>]+", "", text).strip(" \n\t:,-")

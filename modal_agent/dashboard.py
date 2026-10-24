@@ -210,6 +210,10 @@ def generation_info(note):
             st.caption(f"Frames recorded: {parsed['frames'] or 'not recorded'}")
         if generation.get("routing_degraded"):
             st.caption("Category routing degraded to general.")
+        for instruction in note.get("instructions", []):
+            st.write("Your instruction: " + instruction["text"])
+        if note.get("memory_refs"):
+            st.caption("Personal memory was used as context. Manage current memory with /memory in Telegram.")
         if note.get("coverage"):
             st.warning(" ".join(note["coverage"]))
         for key, title in (("description", "Caption"), ("transcript", "Transcript"), ("visual_extraction", "Visual extraction")):
@@ -389,7 +393,7 @@ def main():
 
 def chatbot():
     st.title("Ask your notes")
-    st.caption("Answers use evidence from your saved notes.")
+    st.caption("Answers use your saved notes and relevant personal memory. Manage memory through Telegram with /memory.")
     messages = st.session_state.get("chat_messages", [])
     for message in messages:
         with st.chat_message(message["role"], avatar=":material/person:" if message["role"] == "user" else ":material/assistant:"):
@@ -406,8 +410,9 @@ def chatbot():
         with st.chat_message("assistant", avatar=":material/assistant:"):
             try:
                 with st.spinner("Searching your notes..."):
-                    result = answer(question, storage("retrieve", {"question": retrieval_question(question, history)}), history=history)
-                    result = still_visible(result, storage("list")["records"])
+                    result = answer(question, storage("retrieve", {"question": retrieval_question(question, history)}), history=history,
+                        memories=storage("memory_list", {"query": retrieval_question(question, history)}))
+                    result = still_visible(result, storage("list")["records"], storage("memory_list"))
                 reply = {"role": "assistant", "content": result["answer"], "sources": result.get("source_labels", {}),
                          "source_titles": result.get("source_titles", {})}
             except Exception:
@@ -422,7 +427,11 @@ def chat_answer(message):
         with st.expander("Sources"):
             for name in message["sources"].values():
                 title = message.get("source_titles", {}).get(name, name)
-                st.link_button(title, "?" + urlencode({"note": name}))
+                if name.startswith("memory:"):
+                    st.write(title)
+                    st.caption("Personal memory · inspect or correct it with /memory in Telegram")
+                else:
+                    st.link_button(title, "?" + urlencode({"note": name}))
 
 
 if __name__ == "__main__":

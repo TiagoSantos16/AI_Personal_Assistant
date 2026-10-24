@@ -13,18 +13,20 @@ def endpoint(tmp_path, monkeypatch):
     app = importlib.import_module("app")
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
     monkeypatch.setenv("TELEGRAM_ALLOWED_USER_ID", "7")
-    calls = {"spawn": [], "reaction": [], "send": []}
+    calls = {"spawn": [], "conversation": [], "reaction": [], "send": []}
     monkeypatch.setattr(app, "storage", SimpleNamespace(remote=lambda op, payload=None: dispatch(op, payload, root=tmp_path)))
     monkeypatch.setattr(app, "process_background", SimpleNamespace(spawn=lambda *a: calls["spawn"].append(a)))
     monkeypatch.setattr(app, "ask_background", SimpleNamespace(spawn=lambda *a: calls["spawn"].append(a)))
+    monkeypatch.setattr(app, "conversation_background", SimpleNamespace(spawn=lambda *a: calls["conversation"].append(a)))
     monkeypatch.setattr(app, "react", lambda *a: calls["reaction"].append(a) and False)
     monkeypatch.setattr(app, "send", lambda *a: calls["send"].append(a) and False)
     return app.telegram_webhook.local, calls, app
 
 
-def request(text, update=1, owner=7, header="secret"):
+def request(text, update=1, owner=7, header="secret", message_id=12, reply_id=None):
     async def json():
-        return {"update_id": update, "message": {"from": {"id": owner}, "chat": {"id": 7}, "message_id": 12, "text": text}}
+        return {"update_id": update, "message": {"from": {"id": owner}, "chat": {"id": 7}, "message_id": message_id,
+            "text": text, **({"reply_to_message": {"message_id": reply_id}} if reply_id is not None else {})}}
     return SimpleNamespace(headers={"X-Telegram-Bot-Api-Secret-Token": header}, json=json)
 
 
@@ -132,3 +134,53 @@ def test_malformed_telegram_body_is_delivery_failure(monkeypatch):
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake")
     monkeypatch.setattr(telegram.requests, "post", lambda *a, **k: SimpleNamespace(json=lambda: [], status_code=200))
     assert not telegram.react(7, 12)
+
+
+def test_link_instructions_and_reply_revision(endpoint):
+    function, calls, app = endpoint
+    asyncio.run(function(request("Use bullets https://instagram.com/p/abc/")))
+    asyncio.run(function(request("/revise Focus on implementation", update=2, message_id=13, reply_id=12)))
+    assert len(calls["spawn"]) == 2 and not calls["conversation"]
+    note_job = app.storage.remote("claim", {"job_id": calls["spawn"][-1][0], "attempt": calls["spawn"][-1][1]})["job"]
+    assert [i["text"] for i in note_job["instructions"]] == ["Use bullets", "Focus on implementation"]
+
+
+def test_plain_followup_captures_original_context(endpoint):
+    function, calls, _ = endpoint
+    asyncio.run(function(request("https://instagram.com/p/abc/")))
+    asyncio.run(function(request("Focus on implementation", update=2, message_id=13)))
+    args = calls["conversation"][0]
+    assert args[0] == "Focus on implementation" and args[1]["source_id"] == "abc"
+    assert len(calls["spawn"]) == 1
+    asyncio.run(function(request("Focus on implementation", update=2, message_id=13)))
+    assert len(calls["conversation"]) == 1
+
+
+def test_memory_commands_are_persistent_and_need_no_model(endpoint):
+    function, calls, app = endpoint
+    asyncio.run(function(request("/remember fact:movies:watched:arrival = I watched Arrival")))
+    item = app.storage.remote("memory_list")[0]
+    assert item["scope"] == "movies"
+    asyncio.run(function(request("/memory", update=2)))
+    assert item["id"] in calls["send"][-1][1] and "Updated:" in calls["send"][-1][1]
+    asyncio.run(function(request(f"/correct {item['id']} I have not watched Arrival", update=3)))
+    assert app.storage.remote("memory_list")[0]["text"] == "I have not watched Arrival"
+    asyncio.run(function(request(f"/forget {item['id']}", update=4)))
+    assert app.storage.remote("memory_list") == []
+    assert not calls["spawn"] and not calls["conversation"]
+
+
+def test_memory_and_instructions_do_not_bypass_authorisation(endpoint):
+    function, calls, app = endpoint
+    asyncio.run(function(request("/remember location = Lisbon", owner=8)))
+    asyncio.run(function(request("I watched Arrival", owner=8, update=2)))
+    assert not app.storage.remote("memory_list") and not calls["conversation"]
+
+
+def test_ambiguous_revision_asks_for_reply(endpoint):
+    function, calls, _ = endpoint
+    asyncio.run(function(request("https://instagram.com/p/one/", message_id=12)))
+    asyncio.run(function(request("https://instagram.com/p/two/", update=2, message_id=13)))
+    asyncio.run(function(request("/revise Use bullets", update=3, message_id=14)))
+    assert len(calls["spawn"]) == 2
+    assert "Reply to the original link" in calls["send"][-1][1]

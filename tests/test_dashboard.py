@@ -143,12 +143,12 @@ def test_detail_delete_and_account_label(monkeypatch):
 def test_chat_followup_memory_and_source_dropdown(monkeypatch):
     from core import rag
     histories = []
-    def answer(question, rows, history=None):
+    def answer(question, rows, history=None, memories=None):
         histories.append(list(history or []))
         return {"answer": "## Ingredients\n- 2 eggs [S1]", "sources": ["recipe.md"],
                 "source_labels": {"S1": "recipe.md"}, "source_titles": {"recipe.md": "Egg recipe"}}
     monkeypatch.setattr(rag, "answer", answer)
-    monkeypatch.setattr(rag, "still_visible", lambda result, records: result)
+    monkeypatch.setattr(rag, "still_visible", lambda result, records, memories=None: result)
     at, _ = app(monkeypatch)
     sign_in(at)
     at.segmented_control[0].set_value("Chatbot").run()

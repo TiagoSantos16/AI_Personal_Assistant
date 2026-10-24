@@ -194,6 +194,34 @@ Sign in once on each device and choose **Remember this device for 30 days**. The
 
 Failed notes have a Retry button. Finished notes have a Redo button, which keeps the current note available while its replacement is processed. If redo fails, the current note stays in Notes. If it succeeds, the old content moves to Error/Failed as **Previous version — replaced by redo**, with its original media and costs. A saved note whose indexing failed is kept too, but marked as not searchable yet.
 
+## Link instructions and personal memory (F02 / F03)
+
+Send a link with instructions in the same message or caption, such as `Focus on implementation and use numbered steps https://instagram.com/p/.../`. Instructions stay with that source through retries and redo; later instructions override earlier conflicts. A repeated bare URL, or a repeat of the latest identical instructions, does not start another generation.
+
+Reply to the original link message with more instructions, or use `/revise <instructions>` in that reply. A plain message immediately afterwards can refer to a single source shared in the last 10 minutes. If several sources were shared, the bot asks you to reply to the intended link. Reply associations retain the latest 200 source messages per chat. A new revision supersedes a running attempt, preserves the current saved note, and reuses validated cached extraction when available. An in-flight extraction that has not yet reached the cache may need repeating. Superseded attempts stop before their next model request; their recorded charges remain included in the replacement's costs.
+
+Each instruction message is limited to 4,000 characters, with at most 20 messages / 8,000 characters per source. Ordinary conversational messages are limited to 1,000 characters. Research-depth requests are preserved and guide detail, but external research is still F06: the writer must disclose when requested external verification could not be performed. Instructions are visible in Generation Info.
+
+Personal memory stores explicit first-person facts and enduring preferences separately from source evidence. For example, `I watched Arrival` can be remembered as a fact, and `I prefer concise notes` as a preference. One-off instructions such as `focus on code in this post` stay with the note. Natural-language interpretation uses only the existing free primary in `BASIC_MODELS`, with a 30-second deadline, bounded output and no paid fallback. If interpretation fails or is ambiguous, use the exact commands below; no change is guessed. Memory changes are acknowledged with their ID.
+
+| Telegram command | Example / behaviour |
+|---|---|
+| `/memory` | List all memories, including scope, kind, source message and date. |
+| `/memory <topic>` | Return up to eight locally matched relevant entries. |
+| `/remember <key> = <text>` | `/remember watched:arrival = I watched Arrival` stores a fact without AI. |
+| `/remember <kind>:<scope>:<key> = <text>` | `/remember preference:notes:length = I prefer concise notes` stores a scoped preference without AI. |
+| `/correct <ID> <replacement text>` | Replace the selected memory's text and update its source/date. |
+| `/forget <ID>` | Remove that exact memory. Missing or ambiguous IDs never trigger a guessed deletion. |
+| `/revise <instructions>` | Revise the source identified by the reply or unambiguous recent context, without intent-model inference. |
+
+Supported scopes are `global`, `notes`, `movies`, `books`, `travel`, `coding`, `career`, `finance` and `culinary`; kinds are `fact` and `preference`. Store at most 500 entries, each up to 1,000 characters. One natural-language message should contain one explicit fact or preference. Model-derived keys are best effort: use `/memory` and `/correct` to resolve differently worded or ambiguous corrections. Concurrent memory changes invalidate a pending interpretation instead of allowing it to overwrite a newer correction or resurrect a forgotten entry.
+
+Retrieval uses a bounded local lexical/domain match, with global preferences and note preferences applied only where appropriate. At most eight entries / 4,000 estimated context characters are supplied to a request. This is intentionally simple; it is not semantic search across all autobiographical history. Relevant memory is available to note generation and both dashboard chat and Telegram `/ask`. Answers cite personal memory as `[M1]` separately from note citations `[S1]`; memory-only answers are supported. Corrected or forgotten memory citations are rejected before an answer is delivered. A note generated against a changed memory version must be retried.
+
+`/forget` removes the current memory entry, not existing Telegram messages, generated notes, or the current browser's chat transcript. Source evidence is never mined automatically for personal memory. No new integration, credential, embedding model, or migration command is needed: existing registries gain the memory fields on write.
+
+Watched-film facts persist under F03. Structured watchlists, removing completed items from active lists, and list history remain F04. See [ROADMAP.md](ROADMAP.md) for feature status.
+
 ## Testing
 
 Offline tests use temporary storage and fake external services, including Streamlit AppTest. They cover permissions, duplicates, retries, redo, evidence, costs, retrieval, citations and dashboard actions without paid calls or live data.
@@ -203,7 +231,7 @@ python -m pytest tests -q
 python -m compileall -q modal_agent tests
 ```
 
-The workflow comparison in `tests/test_payloads.py` checks request and image payloads against the earlier pipeline. Mocked payload reductions do not prove live answer quality or billed savings. After deployment, check one reel, one carousel, a duplicate link, `/ask`, successful/failed redo, costs and login on both desktop and phone. Remote GPU/Volume behaviour and browser layouts still need that manual check.
+The workflow comparison in `tests/test_payloads.py` checks request and image payloads against the earlier pipeline. Mocked payload reductions do not prove live answer quality or billed savings. After deployment, check one reel, one carousel, a duplicate link, `/ask`, successful/failed redo, costs and login on both desktop and phone. Remote GPU/Volume behaviour and browser layouts still need that manual check. Also send a link with instructions; revise it by replying to the original link; test an ambiguous follow-up after two links; remember a watched film and a note preference; inspect/correct/forget them with the commands above; and check that `/ask` and dashboard answers use only current relevant memory. Live intent-model accuracy has not been evaluated by the offline tests.
 
 ## Roadmap
 

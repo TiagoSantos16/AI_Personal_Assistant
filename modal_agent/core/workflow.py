@@ -57,7 +57,9 @@ def process(job_id, attempt, storage, transcribe, volume, root="/data"):
         except Exception:
             pass  # keep the local record; retry persistence with the final outcome
     deadline = time.monotonic() + min(360, float(os.environ.get("GENERATION_DEADLINE_SECONDS", "300")))
-    context = CALL_CONTEXT.set({"deadline": deadline, "record": charge})
+    memory_refs = []
+    context = CALL_CONTEXT.set({"deadline": deadline, "record": charge,
+        "is_current": lambda: storage("current", {**identity, "memory_refs": memory_refs}).get("status") != "stale"})
     stage, evidence, final, reused_evidence = "download", {}, {}, False
     saved = None
     try:
@@ -106,6 +108,15 @@ def process(job_id, attempt, storage, transcribe, volume, root="/data"):
             **{k: evidence.get(k, "" if k != "images" and k != "coverage" else []) for k in
                 ("description", "transcript", "visual_extraction", "images", "coverage")}, "drafts": 0,
             "writer_history": [], "critique_history": [], "model_log": []}
+        from core.memory import select
+        initial["instructions"] = job.get("instructions", [])
+        memory_query = " ".join(i["text"] for i in initial["instructions"]) + " " + " ".join(
+            evidence.get(key, "") for key in ("description", "transcript", "visual_extraction"))
+        initial["memories"] = select(storage("memory_list"), memory_query, purpose="notes")
+        memory_refs.extend({"id": m["id"], "revision": m["revision"]} for m in initial["memories"])
+        # Stop superseded attempts before writing/reviewing; storage also checks at save.
+        if storage("current", identity).get("status") == "stale":
+            return
         if not evidence.get("visual_extraction") and evidence.get("images"):
             initial["raw_media_ids"] = list(range(1, min(4, len(evidence["images"])) + 1))
         final = reel_graph.invoke(initial)
@@ -115,6 +126,8 @@ def process(job_id, attempt, storage, transcribe, volume, root="/data"):
             "media": evidence.get("images", []), "generation": {key: final[key] for key in
                 ("description", "transcript", "visual_extraction", "writer_history", "critique_history", "model_log", "routing_degraded") if key in final},
             "review_status": final["review_status"], "coverage": evidence.get("coverage", []),
+            "instructions": job.get("instructions", []),
+            "memory_refs": memory_refs,
             "compute": compute_estimate(time.monotonic() - started,
                 0 if reused_evidence else (None if evidence.get("gpu_measurement_incomplete") else evidence.get("gpu_seconds", 0)))}
         stage = "storage"
@@ -126,7 +139,7 @@ def process(job_id, attempt, storage, transcribe, volume, root="/data"):
         kind = classify(exc, stage)
         try:
             failed = storage("fail", {**identity, "error": redact(exc), "error_kind": kind, "records": records,
-                "metadata": {"media": evidence.get("images", []), "generation": final, "evidence": evidence,
+                "metadata": {"media": evidence.get("images", []), "generation": {k: v for k, v in final.items() if k != "memories"}, "evidence": evidence,
                     "compute": compute_estimate(time.monotonic() - started,
                         0 if reused_evidence else (None if evidence.get("gpu_measurement_incomplete") else evidence.get("gpu_seconds", 0)))},
                 "content": f"# Unfinished note\n\n{final.get('final_note', 'Kept for retry.')}\n"})
