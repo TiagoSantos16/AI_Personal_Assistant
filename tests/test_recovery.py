@@ -135,3 +135,51 @@ def test_retry_uses_persisted_source_kind(tmp_path):
     failed = s("fail", {**identity, "metadata": {"kind": "reel"}, "error": "failed"})
     result = s("accept", {"url": failed["url"], "explicit": True, "previous": "failed/" + failed["name"]})
     assert result["job"]["kind"] == "reel"
+
+
+def test_read_recovers_only_matching_version_cost_ledger(tmp_path, monkeypatch):
+    monkeypatch.setattr(rag, 'index_note', lambda *a: None)
+    s = store(tmp_path)
+    identity = accept_claim(s)
+    cost = accounting.record({'id': 'paid', 'usage': {'cost': .002}}, 'writer', 1)
+    s('ledger', {**identity, 'records': [cost]})
+    note = s('save', {**identity, 'content': '# Note', 'metadata': {'title': 'Note'}})
+    registry = tmp_path / 'private/registry.json'
+    data = json.loads(registry.read_text())
+    key = 'notes/' + note['name']
+    data['records'][key]['accounting'] = []
+    registry.write_text(json.dumps(data))
+    payload = {'section': 'notes', 'name': note['name']}
+    assert s('read', payload)['accounting'] == [cost]
+    data['jobs'][identity['job_id']]['version_id'] = 'different-version'
+    registry.write_text(json.dumps(data))
+    assert s('read', payload)['accounting'] == []
+
+
+def test_real_graph_charges_survive_pipeline_and_note_read(tmp_path, monkeypatch):
+    from core import workflow, graph
+    s = store(tmp_path)
+    monkeypatch.setattr(rag, 'index_note', lambda *a: None)
+    monkeypatch.setattr(workflow, 'prepare', lambda *a: {'description': 'A recipe', 'images': [], 'coverage': []})
+    monkeypatch.setattr(workflow, 'send', lambda *a, **k: True)
+    monkeypatch.setattr(workflow, 'react', lambda *a, **kw: True)
+    monkeypatch.setattr(graph, 'decide', lambda *a: {'category': 'culinary'})
+    def invoke(prompt, **kwargs):
+        critic = 'Check grounding' in str(prompt)
+        return SimpleNamespace(content=json.dumps({'verdict': 'approved'} if critic else
+            {'title': 'Recipe', 'markdown_content': 'Ingredients and steps'}), response_metadata={
+                'accounting': {'id': 'critic' if critic else 'writer', 'usage': {'cost': .000003}}, 'model_name': 'mock'})
+    monkeypatch.setattr(graph, 'get_llm', lambda *a: [SimpleNamespace(model_name='mock', invoke=invoke)])
+    job = s('accept', {'url': 'https://instagram.com/p/Accounting/'})['job']
+    workflow.process(job['job_id'], job['attempt'], s, lambda *a: {}, SimpleNamespace(reload=lambda: None), str(tmp_path))
+    note = next(r for r in s('list')['records'] if r['section'] == 'notes')
+    detail = s('read', {'section': 'notes', 'name': note['name']})
+    assert {r['step'] for r in detail['accounting']} == {'writer', 'critic'}
+    assert sum(r['cost'] for r in detail['accounting']) == .000006
+
+
+@pytest.mark.parametrize('records, expected', [([], 'Cost not recorded'),
+    ([{'record_id': 'unknown', 'cost_status': 'unknown', 'cost': None}], 'AI cost unavailable'),
+    ([{'record_id': 'free', 'cost_status': 'reported', 'cost': 0}], 'Recorded AI cost $0.00000000')])
+def test_cost_summary_distinguishes_missing_unknown_and_free(records, expected):
+    assert accounting.summary(records).startswith(expected)

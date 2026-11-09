@@ -245,8 +245,10 @@ def test_invalid_citations_bounded(monkeypatch):
         calls.append(k)
         return SimpleNamespace(content=json.dumps({"answer": "Invented [S99]", "used_sources": ["S99"]}), response_metadata={})
     monkeypatch.setattr(rag, "invoke_with_retry", invoke)
-    result = rag.answer("quantos ovos?", [{"id": "S1", "source": "a", "text": "2 ovos"}])
-    assert not result["sources"] and len(calls) == 2
+    from core.errors import AnswerValidationError
+    with pytest.raises(AnswerValidationError):
+        rag.answer("quantos ovos?", [{"id": "S1", "source": "a", "text": "2 ovos"}])
+    assert len(calls) == 2
 
 
 def test_internal_sections_excluded():
@@ -281,7 +283,7 @@ def test_notification_failure_preserves_saved(store, tmp_path, monkeypatch):
     monkeypatch.setattr(workflow, "prepare", lambda *a: {"description": "Receita", "transcript": "", "images": [], "coverage": []})
     monkeypatch.setattr(workflow, "visual_extract", lambda *a: ("", [], []))
     monkeypatch.setattr(workflow.reel_graph, "invoke", lambda _: {"title": "Receita", "category": "culinary", "final_note": "2 ovos", "review_status": "approved"})
-    monkeypatch.setattr(workflow, "send", lambda *a: False)
+    monkeypatch.setattr(workflow, "send", lambda *a, **k: False)
     monkeypatch.setattr(workflow, "react", lambda *a, **k: False)
     workflow.process(job["job_id"], job["attempt"], store, lambda _: {}, Volume(), str(tmp_path))
     records = store("list")["records"]

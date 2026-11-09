@@ -49,3 +49,19 @@ def urls(message):
     if not result:
         result = [u.rstrip(".,;!?)>]") for u in re.findall(r"https?://[^\s<>]+", text)]
     return list(dict.fromkeys(result))
+
+
+def source_instructions(message):
+    """Remove link spans in Telegram's UTF-16 coordinates, retaining wording."""
+    text = message.get('text') or message.get('caption') or ''
+    encoded = text.encode('utf-16-le')
+    spans = []
+    for entity in message.get('entities') or message.get('caption_entities') or []:
+        if entity.get('type') in {'text_link', 'url'}:
+            start, length = entity.get('offset'), entity.get('length')
+            if isinstance(start, int) and isinstance(length, int) and start >= 0 and length > 0:
+                spans.append((start * 2, (start + length) * 2))
+    for start, end in sorted(spans, reverse=True):
+        encoded = encoded[:start] + encoded[end:]
+    text = encoded.decode('utf-16-le', errors='replace')
+    return re.sub(r'https?://[^\s<>]+', '', text).strip()

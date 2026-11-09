@@ -45,6 +45,7 @@ def evidence(state):
     return json.dumps({"caption": state.get("description", ""),
         "timestamped_transcript": state.get("transcript", ""),
         "visual_extraction": state.get("visual_extraction", ""),
+        'unextracted_media_ids': state.get('missing_media_ids', []),
         "coverage": state.get("coverage", [])}, ensure_ascii=False)
 
 
@@ -53,9 +54,27 @@ def category_node(state):
     return decide(compact)
 
 
+def user_context(state):
+    return ('\nUSER CONTEXT (separate from source evidence):\n' + json.dumps({
+        'instructions_oldest_first': state.get('instructions', []),
+        'personal_memory': state.get('personal_memory', [])}, ensure_ascii=False) +
+        '\nApply compatible source instructions; later instructions override earlier conflicts. '
+        'Current instructions control focus, structure, language and level of detail. '
+        'Completeness applies within the requested scope; a concise answer may omit unrelated background, '
+        'but must retain material conditions, uncertainty and qualifications. '
+        'For a requested buy/sell/hold summary, report only the source\'s stated assets, actions and timing/conditions. '
+        'If an action or timing is absent or unreadable, say not specified; do not invent a trade recommendation or date. '
+        'Scoped preferences are defaults; explicit current instructions take precedence. '
+        'Personal facts must be labelled as personal memory, never attributed to the source. '
+        'External research is unavailable. Never invent research or claim it was performed; disclose this limit when requested.')
+
+
 def invoke(state, prompt, step, output):
     images = [state.get("images", [])[i - 1] for i in state.get("raw_media_ids", [])
               if 1 <= i <= len(state.get("images", []))]
+    if images:
+        prompt += '\nAttached raw images are in source media ID order: ' + ', '.join(
+            str(i) for i in state.get('raw_media_ids', []) if 1 <= i <= len(state.get('images', [])))
     chain = VISION_CONTENT_MODELS if images else (EDITOR_MODELS if step == "critic" or
         state.get("category") in {"coding", "finance", "career", "general"} else CONTENT_MODELS)
     messages = build_vision_messages(prompt, images) if images else [{"role": "user", "content": prompt}]
@@ -68,7 +87,7 @@ def writer_node(state):
     source_evidence = evidence(state)
     prompt = (WRITER_STYLE + "\n" + INSTRUCTIONS[state.get("category", "general")] +
         '\nReturn JSON only: {"title":"short factual title, max 8 words","markdown_content":"complete Markdown"}.' +
-        "\nSOURCE EVIDENCE:\n" + source_evidence)
+        "\nSOURCE EVIDENCE:\n" + source_evidence + user_context(state))
     if state.get("drafts", 0):
         prompt += "\nPrevious draft:\n" + state["final_note"] + "\nRequired changes:\n" + state.get("critique", "")
     output = max(int(os.environ.get("WRITER_OUTPUT_TOKENS", "1200")), min(6000, len(source_evidence) // 3))
@@ -99,26 +118,32 @@ def critic_node(state):
         "Caption, transcript and visual text complement each other; a detail need match only one. "
         "For uncertain names, unreadable code or missing visual details request up to four 1-based "
         "media_ids. Partial evidence cannot be approved. Return JSON only: "
-        '{"verdict":"approved|revise|raw_media","feedback":"brief actionable changes","media_ids":[]}.' +
-        "\nSOURCE EVIDENCE:\n" + evidence(state) + "\nDRAFT:\n" + state["final_note"])
+        '{"verdict":"approved|revise|raw_media","feedback":"brief actionable changes (at most 250 characters)","media_ids":[]}.' +
+        "\nSOURCE EVIDENCE:\n" + evidence(state) + user_context(state) +
+        '\nCheck compliance with user instructions and accurate disclosure of unavailable research. '
+        'Do not demand omitted background that is outside the user\'s requested scope. ' + "\nDRAFT:\n" + state["final_note"])
     try:
         text, log = invoke(state, prompt, "critic", int(os.environ.get("CRITIC_OUTPUT_TOKENS", "256")))
-        result = Review.model_validate_json(text.removeprefix("```json").removesuffix("```").strip())
+        result = Review.model_validate_json(text.strip().removeprefix("```json").removesuffix("```").strip())
         ids = [i for i in result.media_ids if 1 <= i <= len(state.get("images", []))]
         if result.verdict == "raw_media" and not ids:
             raise ValueError("Invalid raw-media request")
         status = "approved" if result.verdict == "approved" and not state.get("coverage") else "needs_review"
         return {"review_status": status, "critique": result.feedback,
+            'revision_requested': result.verdict != 'approved',
             "raw_media_ids": ids if result.verdict == "raw_media" else state.get("raw_media_ids", []),
             "critique_history": (state.get("critique_history", []) + [result.verdict + ": " + result.feedback])[-2:],
             "model_log": (state.get("model_log", []) + [log])[-5:]}
-    except Exception:
+    except Exception as exc:
+        from core.errors import redact
+        issue = 'Review ' + type(exc).__name__ + ': ' + redact(exc)[:500]
         return {"review_status": "unverified", "critique": "Review unavailable or invalid; check against the source.",
-            "critique_history": (state.get("critique_history", []) + ["unverified"])[-2:]}
+            "critique_history": (state.get("critique_history", []) + [issue])[-2:]}
 
 
 def after_review(state):
-    return "writer" if state["review_status"] == "needs_review" and state.get("drafts", 0) < MAX_DRAFTS else "finalise"
+    return "writer" if (state["review_status"] == "needs_review" and state.get("drafts", 0) < MAX_DRAFTS
+        and state.get('revision_requested', True)) else "finalise"
 
 
 def build_graph():

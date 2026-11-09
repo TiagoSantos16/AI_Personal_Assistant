@@ -1,5 +1,52 @@
 import os
 import re
+import logging
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+
+def conversation_event(correlation_id, stage, status, *, source_id=None, action=None):
+    logger.info('conversation_event correlation=%s stage=%s status=%s source_id=%s action=%s',
+        correlation_id, stage, status, source_id or '-', action or '-')
+
+
+class AnswerValidationError(ValueError):
+    """The provider did not produce a usable, grounded answer within the budget."""
+
+
+class IndexUnavailableError(RuntimeError):
+    """Saved notes exist, but their search index is unavailable."""
+
+
+class AnswerPathError(RuntimeError):
+    """Safe diagnostic metadata; exception text may contain private provider input."""
+    def __init__(self, stage, correlation_id, cause):
+        super().__init__('The answer could not be completed. Please try again later.')
+        self.stage = stage
+        self.correlation_id = correlation_id
+        self.error_type = type(cause).__name__
+        status = getattr(cause, 'status_code', None)
+        self.status_code = status if type(status) is int else None
+        self.provider_failures = []
+        failures = getattr(cause, 'failures', [])
+        for entry in (failures[:8] if isinstance(failures, (list, tuple)) else []):
+            if isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[1], Exception):
+                error = entry[1]
+                code = getattr(error, 'status_code', None)
+                self.provider_failures.append({'type': type(error).__name__, 'status': code if type(code) is int else None})
+
+
+def log_answer_failure(logger, error, *, stage, correlation_id):
+    """Log no exception text/traceback, queries, prompts, credentials or user IDs."""
+    if isinstance(error, AnswerPathError):
+        stage, correlation_id = error.stage, error.correlation_id
+        error_type, status = error.error_type, error.status_code
+    else:
+        error_type, status = type(error).__name__, getattr(error, 'status_code', None)
+    logger.error('answer_failure correlation=%s stage=%s error_type=%s status=%s provider_failures=%s',
+        correlation_id, stage, error_type, status if type(status) is int else 'unavailable',
+        error.provider_failures if isinstance(error, AnswerPathError) else [])
 
 
 def redact(error):

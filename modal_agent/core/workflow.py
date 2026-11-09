@@ -2,6 +2,8 @@
 import os
 import time
 import hashlib
+import re
+import logging
 from pathlib import Path
 from core.accounting import record, compute_estimate
 from core.config import VISION_CONTENT_MODELS
@@ -12,6 +14,33 @@ from core.media import prepare
 from core.telegram import send, react
 
 PIPELINE_VERSION = "evidence-v2"
+
+
+def valid_cache(cached, root):
+    """Never trust stale schemas, missing media or media changed on disk."""
+    if not isinstance(cached, dict) or cached.get('pipeline_version') != PIPELINE_VERSION:
+        return False
+    if not isinstance(cached.get('originating_version'), str) or not isinstance(cached.get('images'), list):
+        return False
+    if not all(isinstance(cached.get(k, ''), str) for k in ('description', 'transcript', 'visual_extraction')):
+        return False
+    if not isinstance(cached.get('hashes'), dict) or not isinstance(cached.get('visual_chunks', []), list):
+        return False
+    try:
+        for value in cached['images']:
+            path = Path(value).resolve()
+            if not path.is_relative_to(Path(root).resolve()) or not path.is_file():
+                return False
+            if hashlib.sha256(path.read_bytes()).hexdigest() != cached['hashes'].get(value):
+                return False
+        for chunk in cached.get('visual_chunks', []):
+            if not isinstance(chunk, dict) or not isinstance(chunk.get('start'), int) or not isinstance(chunk.get('text'), str):
+                return False
+            if chunk['start'] < 0 or chunk['start'] % 4 or chunk['start'] >= len(cached['images']):
+                return False
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
 
 
 def visual_extract(images, labels=None, cached_chunks=None):
@@ -47,6 +76,7 @@ def process(job_id, attempt, storage, transcribe, volume, root="/data"):
     if claimed.get("status") != "claimed":
         return
     job = claimed["job"]
+    delivery_options = {'thread_id': job['thread_id']} if job.get('thread_id') is not None else {}
     started = time.monotonic()
     records = []
     def charge(item):
@@ -57,14 +87,19 @@ def process(job_id, attempt, storage, transcribe, volume, root="/data"):
         except Exception:
             pass  # keep the local record; retry persistence with the final outcome
     deadline = time.monotonic() + min(360, float(os.environ.get("GENERATION_DEADLINE_SECONDS", "300")))
-    context = CALL_CONTEXT.set({"deadline": deadline, "record": charge})
+    def check_current():
+        if not storage('current', identity):
+            raise RuntimeError('Superseded processing attempt')
+    context = CALL_CONTEXT.set({"deadline": deadline, "record": charge, 'check_current': check_current})
     stage, evidence, final, reused_evidence = "download", {}, {}, False
     saved = None
     try:
-        cached = storage("cache_get", {"source_id": job["source_id"]})
+        try:
+            cached = storage("cache_get", {"source_id": job["source_id"]})
+        except ValueError:
+            cached = None  # corrupted JSON is rebuilt, never reused
         volume.reload()
-        cache_valid = cached and cached.get("pipeline_version") == PIPELINE_VERSION and all(Path(p).is_file() and
-            hashlib.sha256(Path(p).read_bytes()).hexdigest() == cached.get("hashes", {}).get(p) for p in cached.get("images", []))
+        cache_valid = valid_cache(cached, root)
         if cache_valid and not cached.get("media_coverage"):
             evidence = cached
             reused_evidence = True
@@ -94,21 +129,38 @@ def process(job_id, attempt, storage, transcribe, volume, root="/data"):
         active_context["deadline"] = min(started + 540, time.monotonic() +
             min(360, float(os.environ.get("GENERATION_DEADLINE_SECONDS", "300"))))
         stage = "media"
+        if not storage('current', identity):
+            return
         extraction, partial, chunks = visual_extract(evidence["images"], evidence.get("image_labels"), evidence.get("visual_chunks"))
         for chunk in chunks:
             chunk.setdefault("originating_version", job["version_id"])
         evidence.update(visual_extraction=extraction, visual_chunks=chunks)
         evidence["coverage"] = list(evidence.get("media_coverage", evidence.get("coverage", []))) + partial
         # Successful chunks survive failures elsewhere. Retry requests only missing chunks.
-        storage("cache_put", {**identity, "evidence": evidence})
+        cached_result = storage("cache_put", {**identity, "evidence": evidence})
+        if isinstance(cached_result, dict) and cached_result.get('status') == 'stale':
+            return
+        memory_query = '\n'.join(str(evidence.get(k, '')) for k in
+            ('description', 'transcript', 'visual_extraction')) + '\n' + '\n'.join(i['text'] for i in job.get('instructions', []))
+        memory = storage('memory_get', {'question': memory_query, 'scope': 'notes'})
+        if not storage('current', identity):
+            return
         stage = "generation"
         initial = {"url": job["url"], "video_path": "reel" if job["kind"] == "reel" else "",
             **{k: evidence.get(k, "" if k != "images" and k != "coverage" else []) for k in
                 ("description", "transcript", "visual_extraction", "images", "coverage")}, "drafts": 0,
-            "writer_history": [], "critique_history": [], "model_log": []}
+            "writer_history": [], "critique_history": [], "model_log": [],
+            'instructions': job.get('instructions', []), 'personal_memory': memory['items']}
+        missing_media_ids = [i + 1 for chunk in chunks if not chunk.get('complete')
+            for i in range(chunk['start'], min(chunk['start'] + 4, len(evidence['images'])))]
+        initial['missing_media_ids'] = missing_media_ids
         if not evidence.get("visual_extraction") and evidence.get("images"):
-            initial["raw_media_ids"] = list(range(1, min(4, len(evidence["images"])) + 1))
+            initial["raw_media_ids"] = missing_media_ids[:4] or list(range(1, min(4, len(evidence["images"])) + 1))
         final = reel_graph.invoke(initial)
+        if evidence.get('coverage') and final['review_status'] == 'approved':
+            final['review_status'] = 'needs_review'
+        if any(re.search(r'research|pesquis|investiga', i['text'], re.I) for i in job.get('instructions', [])):
+            final['final_note'] += '\n\nExternal research was not performed. This note uses the cached or extracted source evidence and labelled personal memory only.'
         content = f"# {final['title']}\n\n**Category:** {final['category'].title()}\n\n{final['final_note']}\n\n---\n**Generation Info:**\n- **Source URL:** {job['url']}\n"
         metadata = {"title": final["title"], "category": final["category"], "creator": evidence.get("creator", ""),
             "creator_url": "https://www.instagram.com/" + evidence.get("username", "").lstrip("@") if evidence.get("username") else "",
@@ -118,7 +170,13 @@ def process(job_id, attempt, storage, transcribe, volume, root="/data"):
             "compute": compute_estimate(time.monotonic() - started,
                 0 if reused_evidence else (None if evidence.get("gpu_measurement_incomplete") else evidence.get("gpu_seconds", 0)))}
         stage = "storage"
-        saved = storage("save", {**identity, "content": content, "metadata": metadata, "records": records})
+        metadata['generation']['instructions'] = job.get('instructions', [])
+        metadata['generation']['memory_revision'] = memory['revision']
+        metadata['generation']['visual_failures'] = [{'media_ids': list(range(c['start'] + 1,
+            min(c['start'] + 4, len(evidence['images'])) + 1)), 'diagnostic': c.get('diagnostic', 'Extraction unavailable')}
+            for c in chunks if not c.get('complete')]
+        saved = storage("save", {**identity, "content": content, "metadata": metadata, "records": records,
+            'memory_revision': memory['revision'], 'memory_query': memory_query, 'memory_fingerprint': memory.get('fingerprint')})
         if saved.get("status") == "stale":
             return
     except Exception as exc:
@@ -135,18 +193,34 @@ def process(job_id, attempt, storage, transcribe, volume, root="/data"):
         except Exception:
             # Never claim a failure record exists if storage itself failed.
             kind = "storage"
-        delivery = send(job.get("chat_id"), user_message(kind))
+        delivery = send(job.get("chat_id"), user_message(kind), **delivery_options)
         storage("notify", {**identity, "success": delivery})
     finally:
+        if records and not saved:
+            try:
+                storage('ledger', {**identity, 'records': records})
+            except Exception:
+                pass  # a storage outage cannot be acknowledged as successful persistence
         CALL_CONTEXT.reset(context)
         react(job.get("chat_id"), job.get("message_id"), clear=True)
     if saved:
         text = f"Saved: {saved['title']}"
+        if saved.get('coverage'):
+            text += '\nSaved in Notes as Needs review: some source evidence is incomplete. Use Retry missing media in the dashboard.'
+        elif saved.get('review_status') in {'needs_review', 'unverified'}:
+            text += '\nSaved in Notes; review is incomplete.'
         if saved.get("index_pending"):
             text += "\nI saved the note, but it isn't searchable yet."
         url = os.environ.get("UI_URL")
         if url:
             from urllib.parse import urlencode
             text += "\n" + url.rstrip("/") + "/?" + urlencode({"note": saved["name"]})
-        delivery = send(job.get("chat_id"), text)
+        delivery = send(job.get("chat_id"), text, capture=True, **delivery_options)
+        if isinstance(delivery, dict):
+            for message_id in delivery['message_ids']:
+                try:
+                    storage('source_register', {**job, 'message_id': message_id})
+                except Exception as exc:
+                    logging.getLogger(__name__).warning('Source notification mapping failed (%s)', type(exc).__name__)
+            delivery = delivery['success']
         storage("notify", {**identity, "success": delivery})

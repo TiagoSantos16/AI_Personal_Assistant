@@ -19,5 +19,9 @@ class AgentState(TypedDict, total=False):
     drafts: int
     review_status: str
     raw_media_ids: list[int]
+    missing_media_ids: list[int]
     routing_degraded: bool
     writer_failed: bool
+    revision_requested: bool
+    instructions: list[dict]
+    personal_memory: list[dict]

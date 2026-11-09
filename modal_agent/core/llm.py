@@ -176,6 +176,8 @@ def invoke_with_retry(llms: list[ChatOpenAI], content, *, step="generation", out
     failures: list[tuple[str, Exception]] = []
     for llm in llms:
         for attempt in range(RETRY_ATTEMPTS):
+            if context.get('check_current'):
+                context['check_current']()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("Generation deadline exhausted")

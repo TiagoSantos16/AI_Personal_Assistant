@@ -42,11 +42,17 @@ def compute_estimate(cpu_seconds, gpu_seconds=0, index_seconds=0):
 
 
 def summary(records, compute=None):
-    if records is None:
+    if not records:
+        if compute and compute.get('status') == 'estimated':
+            return f"Estimated compute ${compute['estimate']:.8f} · AI cost not recorded"
         return "Cost not recorded"
     records = deduplicate(records)
     cost = sum(r.get("cost") or 0 for r in records if r.get("cost_status") != "reused")
     incomplete = any(r.get("cost_status") == "unknown" for r in records)
+    if incomplete and not any(r.get('cost') is not None and r.get('cost_status') != 'reused' for r in records):
+        if compute and compute.get('status') == 'estimated':
+            return f"Estimated compute ${compute['estimate']:.8f} · AI cost unavailable"
+        return "AI cost unavailable · incomplete"
     if compute and compute.get("status") == "estimated":
         return f"Estimated total ${cost + compute['estimate']:.8f} · incomplete"
     return f"Recorded AI cost ${cost:.8f}" + (" · incomplete" if incomplete else "")

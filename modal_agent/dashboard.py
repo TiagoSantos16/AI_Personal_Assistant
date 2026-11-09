@@ -8,7 +8,7 @@ from datetime import datetime
 from urllib.parse import urlsplit, urlencode
 import pandas as pd
 import streamlit as st
-from core.accounting import summary
+from core.accounting import summary, deduplicate
 from core.auth import COOKIE, issue, valid
 
 device_cookie = st.components.v2.component("device_cookie", js="""
@@ -150,12 +150,6 @@ def collection(revision):
 
 def refresh():
     collection.clear()
-    search.clear()
-
-
-@st.cache_data(ttl=20, max_entries=128, show_spinner=False)
-def search(query, revision, entries):
-    return storage("search", {"query": query, "records": [{"section": section, "name": name} for section, name in entries]})
 
 
 def safe_url(value):
@@ -184,19 +178,44 @@ def render_content(content):
 
 
 def cost_details(note):
+    records, compute = note.get('accounting'), note.get('compute') or {}
     with st.expander("Cost details"):
-        records = note.get("accounting")
-        if records is None:
-            st.caption("Cost not recorded. Legacy notes are never regenerated for pricing.")
-            return
-        st.caption("AI subtotal: " + summary(records))
+        st.caption('AI subtotal: ' + summary(records))
         if records:
-            st.dataframe(pd.DataFrame(records)[["step", "model", "cost", "cost_status", "duration", "success"]],
-                hide_index=True, width="stretch", column_config={"cost": st.column_config.NumberColumn("USD", format="$%.8f")})
-        st.caption("AI subtotal uses provider-reported usage.cost only. Cached evidence has no new API charge. Timeouts may be billed; unavailable charges are unknown.")
-        st.caption(note.get("compute", {}).get("explanation", "Compute cost unavailable; allocation and shared idle overhead are not measured."))
-        if note.get("compute", {}).get("details"):
-            st.dataframe(note["compute"]["details"], hide_index=True, width="stretch")
+            rows = pd.DataFrame(deduplicate(records)).reindex(columns=["step", "model", "cost", "cost_status", "duration", "success"])
+            st.dataframe(rows, hide_index=True, width="stretch", column_config={
+                'step': 'Step', 'model': 'Model', 'cost_status': 'Charge status',
+                'duration': st.column_config.NumberColumn('Seconds', format='%.2f'),
+                'success': 'Succeeded', 'cost': st.column_config.NumberColumn('USD', format='$%.8f')})
+            st.caption('Reported $0 is free usage; unavailable charges are not zero. Cached evidence adds no new API charge. Failed calls may still be billed.')
+        else:
+            st.info('No AI charges were recorded for this version. Historical prices cannot be reconstructed from the note; it will not be regenerated for pricing.')
+        if compute.get('details'):
+            st.caption('Compute usage' + (' (estimated cost)' if compute.get('status') == 'estimated' else ' (rates not configured; cost unavailable)'))
+            st.dataframe(compute['details'], hide_index=True, width='stretch', column_config={
+                'estimate': st.column_config.NumberColumn('Estimated USD', format='$%.8f'),
+                'usd_per_second': st.column_config.NumberColumn('USD / second', format='$%.8f')})
+        st.caption(compute.get('explanation') or 'Compute cost unavailable. Optional Modal resource rates can be configured; no rates are assumed.')
+
+
+def selected_media(note):
+    if not st.toggle('Show selected media', key='media-' + note['name']):
+        return
+    try:
+        images = storage('media', {'section': note['section'], 'name': note['name']})
+    except Exception:
+        st.warning("Couldn't load selected media. Try toggling it again shortly.")
+        return
+    if not images:
+        st.caption('Selected media is no longer available.')
+        return
+    st.caption('Use the expand icon on an image to view it full size.')
+    with st.container(horizontal=True, wrap=True):
+        for index, image in enumerate(images, 1):
+            with st.container(width=180):
+                # Limit the layout, not the image resolution used by the full-screen viewer.
+                st.image(image, width='content', caption=f'{index} of {len(images)}',
+                    alt=f'Selected source image {index} for {note["title"]}')
 
 
 def generation_info(note):
@@ -210,6 +229,11 @@ def generation_info(note):
             st.caption(f"Frames recorded: {parsed['frames'] or 'not recorded'}")
         if generation.get("routing_degraded"):
             st.caption("Category routing degraded to general.")
+        if generation.get('instructions'):
+            st.subheader('Source instructions (oldest first)')
+            for instruction in generation['instructions']:
+                st.text(instruction['text'])
+                st.caption(f"Message {instruction.get('message_id')} · date {instruction.get('date')}")
         if note.get("coverage"):
             st.warning(" ".join(note["coverage"]))
         for key, title in (("description", "Caption"), ("transcript", "Transcript"), ("visual_extraction", "Visual extraction")):
@@ -225,9 +249,7 @@ def generation_info(note):
             st.dataframe(generation["model_log"], hide_index=True, width="stretch")
         # Media is served through a validated storage read, never from arbitrary source paths.
         if note.get("media"):
-            if st.button("Show selected media", key="media-" + note["name"]):
-                for media in storage("media", {"section": note["section"], "name": note["name"]}):
-                    st.image(media, width="stretch")
+            selected_media(note)
 
 
 def dismiss_delete():
@@ -263,14 +285,20 @@ def delete_controls(records, key):
         confirm_delete(st.session_state.pending_delete)
 
 
+def back_to_collection(section):
+    st.query_params.clear()
+    st.session_state.page = 'Notes'
+    st.session_state.section = section
+    st.session_state.category = 'All'
+    refresh()
+
+
 def detail(note):
-    if st.button("Back to collection"):
-        st.query_params.clear()
-        st.session_state.page = "Notes"
-        st.rerun()
+    st.button('Back to collection', on_click=back_to_collection, args=(note['section'],))
     st.title(note["title"])
     date = datetime.fromtimestamp(note.get("saved", note.get("created", 0))).strftime("%d %b %Y")
-    st.caption(f"{note.get('category', 'General').title()} · {date} · {note.get('review_status', 'Review not recorded')} · {summary(note.get('accounting'), note.get('compute'))}")
+    review = note.get('review_status', 'Review not recorded').replace('_', ' ').capitalize()
+    st.caption(f"{note.get('category', 'General').title()} · {date} · {review} · {summary(note.get('accounting'), note.get('compute'))}")
     if note["status"] == "superseded":
         st.info("Previous version — replaced by redo")
     elif note["status"] == "failed":
@@ -278,6 +306,9 @@ def detail(note):
         st.warning(user_message(note.get("error_kind")))
     elif note.get("index_pending"):
         st.warning("Saved, but not searchable yet. Reindex in Settings to retry indexing.")
+    if note['section'] == 'notes' and note.get('coverage'):
+        st.warning('Saved in Notes with incomplete source evidence. Some details may be missing. '
+            'Use Retry missing media below to retry extraction from cached media; the current note stays available.')
     links = st.columns(2)
     if safe_url(note.get("url")):
         links[0].link_button("Source post", note["url"])
@@ -286,7 +317,7 @@ def detail(note):
     render_content(note["content"])
     generation_info(note)
     cost_details(note)
-    action = "Retry" if note["status"] == "failed" else "Redo"
+    action = 'Retry' if note['status'] == 'failed' else ('Retry missing media' if note.get('coverage') else 'Redo')
     if st.button(action, key="redo-" + note["name"]):
         import modal
         try:
@@ -296,10 +327,15 @@ def detail(note):
         except Exception:
             st.error("Could not start processing. Please try again later.")
     delete_controls([note], note["name"])
-    if note.get("diagnostic") or note.get("index_diagnostic"):
+    visual_failures = (note.get('generation') or {}).get('visual_failures', [])
+    if note.get("diagnostic") or note.get("index_diagnostic") or visual_failures:
         with st.expander("Owner error details"):
             st.caption("Job reference: " + note.get("job_id", note["version_id"])[:12])
-            st.code(note.get("diagnostic") or note.get("index_diagnostic"), language=None)
+            if note.get('diagnostic') or note.get('index_diagnostic'):
+                st.code(note.get("diagnostic") or note.get("index_diagnostic"), language=None)
+            for failure in visual_failures:
+                st.caption('Visual extraction: media ' + ', '.join(map(str, failure['media_ids'])))
+                st.code(failure['diagnostic'], language=None)
 
 
 def main():
@@ -326,7 +362,6 @@ def main():
         section = st.radio("Collection", ["notes", "failed"], format_func=lambda s:
             f"{'Notes' if s == 'notes' else 'Error/Failed'} ({counts[s]})", key="section")
         category = st.selectbox("Category", ["All"] + sorted({r.get("category", "general") for r in records}), key="category")
-        query = st.text_input("Search notes", key="search")
         with st.expander("Settings"):
             if st.button("Reindex notes"):
                 try:
@@ -364,9 +399,7 @@ def main():
         st.warning("This note is no longer available.")
     st.title("Notes" if section == "notes" else "Error/Failed")
     filtered = [r for r in records if r["section"] == section and (category == "All" or r.get("category") == category)]
-    if query:
-        # Full-text search is performed on demand, never on unrelated widget reruns.
-        filtered = search(query, data["revision"], tuple((r["section"], r["name"]) for r in filtered))
+    filtered.sort(key=lambda r: (r.get('saved', r.get('created', 0)), r['name']), reverse=True)
     if not filtered:
         st.info("No matching notes." if records else "Send an Instagram reel or post to your bot to create your first note.")
         return
@@ -389,14 +422,14 @@ def main():
 
 def chatbot():
     st.title("Ask your notes")
-    st.caption("Answers use evidence from your saved notes.")
+    st.caption("Answers use saved notes and relevant personal memory. Manage memory with Telegram /memory.")
     messages = st.session_state.get("chat_messages", [])
     for message in messages:
         with st.chat_message(message["role"], avatar=":material/person:" if message["role"] == "user" else ":material/assistant:"):
             chat_answer(message)
     question = st.chat_input("Ask a question about your notes", submit_mode="disable")
     if question:
-        from core.rag import answer, still_visible, retrieval_question, retrieval_topic
+        from core.rag import grounded_answer, retrieval_topic
         history = messages
         messages = messages + [{"role": "user", "content": question,
                                 "retrieval_topic": retrieval_topic(question, history)}]
@@ -406,8 +439,7 @@ def chatbot():
         with st.chat_message("assistant", avatar=":material/assistant:"):
             try:
                 with st.spinner("Searching your notes..."):
-                    result = answer(question, storage("retrieve", {"question": retrieval_question(question, history)}), history=history)
-                    result = still_visible(result, storage("list")["records"])
+                    result = grounded_answer(question, storage, history=history)
                 reply = {"role": "assistant", "content": result["answer"], "sources": result.get("source_labels", {}),
                          "source_titles": result.get("source_titles", {})}
             except Exception:
