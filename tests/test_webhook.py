@@ -137,12 +137,13 @@ def test_missing_configuration(endpoint, monkeypatch, caplog, missing):
 def test_dashboard_server_settings(endpoint, monkeypatch):
     import ast
     import subprocess
+    import sys
     _, _, app = endpoint
     calls = []
     monkeypatch.setattr(subprocess, "Popen", lambda args, **kwargs: calls.append(args))
     app.ui.local()
-    assert "--browser.gatherUsageStats=false" in calls[0]
-    assert "--server.enableXsrfProtection=true" in calls[0]
+    assert calls[0][:4] == [sys.executable, '-m', 'uvicorn', 'dashboard_server:app']
+    assert calls[0][4:] == ['--host', '0.0.0.0', '--port', '8000', '--proxy-headers', '--forwarded-allow-ips', '*']
     tree = ast.parse(Path(app.__file__).read_text(encoding="utf-8"))
     ui = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "ui")
     settings = {decorator.func.attr: {kw.arg: ast.literal_eval(kw.value) for kw in decorator.keywords

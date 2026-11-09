@@ -12,9 +12,11 @@ image = (modal.Image.debian_slim(python_version="3.11").apt_install("ffmpeg", "t
     .env({"FASTEMBED_CACHE_PATH": "/models/fastembed"})
     .pip_install_from_pyproject("pyproject.toml")
     .run_commands('python -c "from fastembed import TextEmbedding; TextEmbedding(\'BAAI/bge-small-en-v1.5\')"')
-    .add_local_python_source("core").add_local_file("dashboard.py", "/root/dashboard.py")
+    .add_local_python_source("core")
     .add_local_file("dashboard_server.py", "/root/dashboard_server.py")
-    .add_local_file(".streamlit/config.toml", "/root/.streamlit/config.toml"))
+    .add_local_file("dashboard_auth.py", "/root/dashboard_auth.py")
+    .add_local_file("dashboard_store.py", "/root/dashboard_store.py")
+    .add_local_dir("dashboard_web/dist", "/root/dashboard_web/dist"))
 app = modal.App("personal-assistant")
 vol = modal.Volume.from_name("personal-assistant-data-v2", create_if_missing=True, version=2)
 weights = modal.Volume.from_name("personal-assistant-whisper-weights", create_if_missing=True)
@@ -27,6 +29,9 @@ secrets = [modal.Secret.from_name("personal-assistant-secrets", required_keys=[
 def storage(operation: str, payload: dict = None):
     from core.storage import dispatch
     vol.reload()  # no open handles survive dispatch
+    if operation == 'dashboard_snapshot':
+        from dashboard_store import snapshot
+        return snapshot(volume=vol)
     return dispatch(operation, payload, volume=vol)
 
 
@@ -389,6 +394,9 @@ async def telegram_webhook(request: Request):
 @modal.web_server(8000, startup_timeout=60)
 def ui():
     import subprocess
-    subprocess.Popen(["streamlit", "run", "/root/dashboard_server.py", "--server.port=8000",
-        "--server.address=0.0.0.0", "--server.headless=true", "--server.enableCORS=true",
-        "--server.enableXsrfProtection=true", "--browser.gatherUsageStats=false"], cwd="/root")
+    import sys
+    # This port is reached through Modal's TLS-terminating proxy. Preserve the
+    # external HTTPS scheme for same-origin checks and secure session cookies.
+    subprocess.Popen([sys.executable, "-m", "uvicorn", "dashboard_server:app",
+        "--host", "0.0.0.0", "--port", "8000", "--proxy-headers",
+        "--forwarded-allow-ips", "*"], cwd="/root")
